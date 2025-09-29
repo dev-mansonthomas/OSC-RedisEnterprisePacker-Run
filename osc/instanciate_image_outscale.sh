@@ -83,7 +83,6 @@ else
 fi
 echo "#########################################"
 
-KEY_NAME="${KEY_NAME:-}"
 SECURITY_GROUP_ID="${OSC_SG_ID:-}"
 SUBNET_ID_VAR="OSC_SUBNET${SUBNET_IDX}"
 SUBNET_ID="${!SUBNET_ID_VAR}"
@@ -93,7 +92,6 @@ INSTANCE_NAME="redis-node-${NODE_IDX}"
 OAPI_PROFILE="default"
 
 if [[ -z "$AMI_ID"            ]]; then echo "Erreur: OUTSCALE_AMI_ID n'est pas défini";     exit 1; fi
-if [[ -z "$KEY_NAME"          ]]; then echo "Erreur: KEY_NAME n'est pas défini";            exit 1; fi
 if [[ -z "$SECURITY_GROUP_ID" ]]; then echo "Erreur: OSC_SG_ID n'est pas défini";               exit 1; fi
 if [[ -z "$SUBNET_ID"         ]]; then echo "Erreur: ${SUBNET_ID_VAR} n'est pas défini";    exit 1; fi
 
