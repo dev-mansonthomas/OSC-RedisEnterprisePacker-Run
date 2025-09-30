@@ -157,8 +157,8 @@ echo "Waiting for instance $INSTANCE_ID to pass status checks..."
 get_state_vm=""
 filter_json_st='{"VmIds":["'"$INSTANCE_ID"'"]}'
 until [ "$get_state_vm" = "running" ] ; do
-  sleep 10
-  echo "[INFO][5s] - Waiting Vm ..."
+  sleep 3
+  echo "[INFO][3s] - Waiting Vm ..."
   get_state_vm=$(oapi-cli ReadVmsState --Filters "$filter_json_st" \
                  | jq -r '.VmStates[].VmState')
   echo "Instance $INSTANCE_ID is '$get_state_vm'"
@@ -172,8 +172,49 @@ oapi-cli --profile "$OAPI_PROFILE" CreateTags \
          --Tags '[{"Key":"Name","Value":"'"$INSTANCE_NAME"'"}]'
 
 
-echo "Sleeping 15 seconds to let the instance initialize..."
-sleep 15
+# Randomly get ssh connection refused after 15, 20 seconds, so instead I test if the ssh connection is ready
+# --- SSH readiness wait ---
+PUBLIC_IP="${PUBLIC_IP:?PUBLIC_IP manquant}"
+SSH_USER="outscale"
+
+SSH_OPTS=(
+  -o StrictHostKeyChecking=no
+  -o UserKnownHostsFile=/dev/null
+  -o BatchMode=yes
+  -o ConnectTimeout=5
+  -o ConnectionAttempts=1
+)
+
+MAX_WAIT="${MAX_WAIT:-600}"   # en secondes (10 min par défaut)
+SLEEP_STEP="${SLEEP_STEP:-5}" # pause entre essais
+
+echo "Waiting for SSH on ${PUBLIC_IP} (timeout ${MAX_WAIT}s)..."
+start_ts=$(date +%s)
+attempt=0
+while true; do
+  attempt=$((attempt + 1))
+  # 1) Test TCP rapide via /dev/tcp (si dispo sur ce bash)
+  if exec 3<>"/dev/tcp/${PUBLIC_IP}/22" 2>/dev/null; then
+    exec 3>&- 3<&-
+    # 2) Test d'un handshake SSH minimal (auth non interactive)
+    if ssh "${SSH_OPTS[@]}" -i "$OUTSCALE_SSH_KEY" "${SSH_USER}@${PUBLIC_IP}" true 2>/dev/null; then
+      echo "SSH is ready on ${PUBLIC_IP} after ${attempt} attempt(s)."
+      break
+    fi
+  fi
+
+  now_ts=$(date +%s)
+  elapsed=$(( now_ts - start_ts ))
+  if (( elapsed >= MAX_WAIT )); then
+    echo "ERROR: SSH not ready on ${PUBLIC_IP} after ${elapsed}s."
+    echo "Hints: check Security Group/ACL (port 22), route/NAT, public key and user '${SSH_USER}' are correct."
+    exit 1
+  fi
+
+  printf "  ...not ready yet (attempt %d, elapsed %ds). Retrying in %ds...\n" "$attempt" "$elapsed" "$SLEEP_STEP"
+  sleep "$SLEEP_STEP"
+done
+# --- end SSH readiness wait ---
 
 # On sauvegarde aussi l'IP et l'ID dans ton _my_env.sh
 echo -e "OUTSCALE_INSTANCE_PUBLIC_IP_${NODE_IDX}=${PUBLIC_IP} #${INSTANCE_ID}" >> "$(dirname "$0")/../_my_env.sh"

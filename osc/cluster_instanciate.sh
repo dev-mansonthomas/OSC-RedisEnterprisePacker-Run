@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
+# --- Chrono start ---
+SECONDS=0
+
 source "$(dirname "$0")/../_my_env.sh"
 set -euo pipefail
 
 # ---------- Params ----------
 NODES=3
+PARALLEL=0   # 0 = illimité, sinon limite le nombre de jobs en parallèle
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --nodes) NODES="${2:-}"; shift 2 ;;
+    --parallel) PARALLEL="${2:-0}"; shift 2 ;;
     -h|--help)
       cat <<EOF
-Usage: $0 [--nodes <odd between 3 and 35>]
+Usage: $0 [--nodes <odd between 3 and 35>] [--parallel <0|N>]
 
-Default value : --nodes 3
-AZ deployment : round-robin on 3 AZ/subnets (AZ1, AZ2, AZ3)
+Default: --nodes 3, --parallel 0 (illimité)
+AZ deployment: round-robin on 3 AZ/subnets (AZ1, AZ2, AZ3)
 EOF
       exit 0
       ;;
@@ -58,25 +64,18 @@ EOF
 fi
 
 # ---------- Helpers ----------
-# rr_idx: 1->1, 2->2, 3->3, 4->1, 5->2, 6->3, ...
 rr_idx() { local i="$1"; echo $(( ((i-1) % 3) + 1 )); }
 
-# lance un nœud et retourne son IP (à partir de OUTSCALE_INSTANCE_PUBLIC_IP_<index>)
 launch_node() {
   local node_idx="$1"
   local subnet_idx; subnet_idx="$(rr_idx "$node_idx")"
-
   ./instanciate_image_outscale.sh \
     --node-num "${node_idx}" \
-    --subnet "${subnet_idx}" 
-  #relead env file as new var is set for the IP of the new instance
-  source "$(dirname "$0")/../_my_env.sh"
+    --subnet "${subnet_idx}"
 }
 
-# configure un nœud (init ou join)
 configure_node() {
   local ip="$1" zone="$2" mode="$3" ord="$4" master_ip="${5:-}"
-
   scp $SSH_OPTS -i "$TARGET_SSH_KEY" \
     ../image_scripts/create-or-join-redis-cluster.sh \
     outscale@"$ip":/home/outscale/create-or-join-redis-cluster.sh
@@ -89,45 +88,96 @@ configure_node() {
 EOF
 }
 
+# Petit helper pour plafonner le parallélisme
+wait_slot() {
+  if (( PARALLEL > 0 )); then
+    # Attends qu'il y ait moins de PARALLEL jobs actifs
+    while (( $(jobs -r -p | wc -l) >= PARALLEL )); do
+      # bash 5: wait -n (sinon attend un peu)
+      if wait -n 2>/dev/null; then :; else sleep 0.2; fi
+    done
+  fi
+}
+
 # ---------- Déploiement ----------
 declare -a NODE_IPS
 
-# Node 1 (init) sur AZ1
-zone="$OSC_AZ1"
-echo ">>> Déploiement node 1 (init) sur AZ1…"
+# Node 1 (init) sur AZ1 (séquentiel, on initialise le cluster)
+zone="${OSC_AZ1}"
+echo ">>> Déploiement node 1 (init) sur AZ1..."
 launch_node 1
+# recharge l'env (IP master ajoutée par le script d'instanciation)
+source "$(dirname "$0")/../_my_env.sh"
 ip_master="${OUTSCALE_INSTANCE_PUBLIC_IP_1:?OUTSCALE_INSTANCE_PUBLIC_IP_1 manquante}"
 NODE_IPS[1]="$ip_master"
 configure_node "$ip_master" "$zone" "init" 1
 echo "sleep 30 seconds to let the cluster initialize..."
 sleep 30
 
-# Nodes 2..N (join), round-robin sur AZ1/AZ2/AZ3
+# Instanciation + configuration en parallèle pour nodes 2..N
+echo ">>> Instanciation + join en parallèle des nodes 2..$NODES..."
+tmp_ips_file="$(mktemp)"
+pids=()
 for i in $(seq 2 "$NODES"); do
-  idx="$(rr_idx "$i")"
-  zone_var="OSC_AZ${idx}"
-  zone="${!zone_var}"
-  echo ">>> Déploiement node $i (join) sur ${zone_var}…"
-  launch_node "$i"
-  ip_var="OUTSCALE_INSTANCE_PUBLIC_IP_${i}"
-  ip_i="${!ip_var:?$ip_var manquante}"
-  NODE_IPS[$i]="$ip_i"
-  configure_node "$ip_i" "$zone" "join" "$i" "$ip_master"
+  wait_slot
+  (
+    # 1/ décalage initial
+    sleep "$i"
+
+    # 2/ instanciation
+    idx="$(rr_idx "$i")"
+    zone_var="OSC_AZ${idx}"
+    zone="${!zone_var}"
+    echo " -> [node $i] instanciation sur $zone_var..."
+    launch_node "$i"
+
+    # recharger l'env pour récupérer l'IP du node i
+    source "$(dirname "$0")/../_my_env.sh"
+    ip_var="OUTSCALE_INSTANCE_PUBLIC_IP_${i}"
+    ip_i="${!ip_var:?$ip_var manquante}"
+
+    # 2bis/ configuration immédiate (join)
+    echo " -> [node $i] join sur $zone_var ($zone) IP=$ip_i..."
+    configure_node "$ip_i" "$zone" "join" "$i" "$ip_master"
+    echo " -> [node $i] join terminé."
+
+    # enregistrer l'IP pour le récap final (dans le parent après wait)
+    printf "%s %s\n" "$i" "$ip_i" >> "$tmp_ips_file"
+  ) & pids+=("$!")
 done
+
+# 3/ attendre la fin de tous les jobs parallèles
+for p in "${pids[@]}"; do wait "$p"; done
+
+# reconstruire NODE_IPS avec les IP collectées
+while read -r idx ip; do
+  NODE_IPS[idx]="$ip"
+done < "$tmp_ips_file"
+rm -f "$tmp_ips_file"
 
 # ---------- Récap DNS ----------
 echo "
 Configure your DNS with the following entries:
 ###############################################################################################"
-for n in 1 2 3; do
+# Enregistrements A pour chaque NS
+for n in $(seq 1 "$NODES"); do
   [[ -n "${NODE_IPS[$n]:-}" ]] && echo "ns${n}.${OUTSCALE_CLUSTER_DNS}. 10800 IN A ${NODE_IPS[$n]}"
 done
+
+# Alias A pour le domaine principal
 for n in "${!NODE_IPS[@]}"; do
   echo "${OUTSCALE_CLUSTER_DNS}. 10800 IN A ${NODE_IPS[$n]}"
 done
-echo "${OUTSCALE_CLUSTER_DNS}. 10800 IN NS ns1.${OUTSCALE_CLUSTER_DNS}."
-echo "${OUTSCALE_CLUSTER_DNS}. 10800 IN NS ns2.${OUTSCALE_CLUSTER_DNS}."
-echo "${OUTSCALE_CLUSTER_DNS}. 10800 IN NS ns3.${OUTSCALE_CLUSTER_DNS}."
+
+# Enregistrements NS (autant que de nœuds)
+for n in $(seq 1 "$NODES"); do
+  echo "${OUTSCALE_CLUSTER_DNS}. 10800 IN NS ns${n}.${OUTSCALE_CLUSTER_DNS}."
+done
 echo "###############################################################################################"
 
 echo "Cluster setup complete. Access your cluster at https://$cluster_dns:8443 with username $RS_admin and password $RS_password."
+
+# --- Chrono end ---
+mins=$(( SECONDS / 60 ))
+secs=$(( SECONDS % 60 ))
+echo "Durée d'exécution : ${mins} minute(s) et ${secs} seconde(s)"
