@@ -6,13 +6,18 @@ pause() {
   read -rp "Press any key to continue..." -n1
   echo    # retour à la ligne après la touche
 }
-# Valeurs par défaut
+# Valeurs par défaut — _my_env.sh (sourcé ci-dessus) est PRIORITAIRE.
+# Avant, ces lignes écrasaient la config de l'opérateur (cf. docs/tasks.md F-04).
+#   `:=` -> on ne substitue que si la variable est absente ou vide.
+#   `=`  -> on ne substitue que si la variable est absente : FLEX_FLAG="" est un
+#           choix explicite ("pas de flex") et doit être respecté.
 SUBNET_IDX=""
-MACHINE_TYPE="tinav5.c2r4p3"    # specific machine type to outscale
-FLEX_FLAG="flex"                # set to "" if you don't want flex
-FLEX_SIZE_GB="40"               # 2 volumes in RAID0 of this size will be provisionned if FLEX_FLAG is set
-VOLUME_TYPE="io1"               # gp2 (SSD), io1 (provisioned IOPS SSD)
-FLEX_IOPS="${FLEX_IOPS:-1000}"  # IOPS per volume for io1 (min 100, max 64000 for AWS, 20000 for outscale, ratio 50 IOPS/GB) 
+NODE_IDX=""
+: "${MACHINE_TYPE:=tinav5.c2r4p3}"  # specific machine type to outscale
+: "${FLEX_FLAG=flex}"               # set to "" in _my_env.sh if you don't want flex
+: "${FLEX_SIZE_GB:=40}"             # 2 volumes in RAID0 of this size will be provisionned if FLEX_FLAG is set
+: "${VOLUME_TYPE:=io1}"             # gp2 (SSD), io1 (provisioned IOPS SSD)
+: "${FLEX_IOPS:=1000}"              # IOPS per volume for io1 (min 100, max 64000 for AWS, 20000 for outscale, ratio 50 IOPS/GB)
 
 usage() {
   cat <<EOF
