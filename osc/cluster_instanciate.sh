@@ -50,6 +50,9 @@ FLE_CMD=""
 if [[ "${FLEX_FLAG:-}" == "flex" ]]; then
   FLE_CMD=$(cat <<'EOF'
 set -euo pipefail
+# Force les disques à être reconnus comme SSD (rotational=0) au lieu de HDD (rotational=1).
+# Utile pour le cloud Outscale où les volumes io1 peuvent être mal détectés par le kernel.
+# Cette étape n'est pas forcément nécessaire sur d'autres clouds (AWS, Azure, GCP, etc.).
 sudo tee /etc/udev/rules.d/99-rotational-fix.rules >/dev/null <<'RULES'
 ACTION=="add|change", KERNEL=="sd*", ATTR{queue/rotational}="0"
 ACTION=="add|change", KERNEL=="vd*", ATTR{queue/rotational}="0"
@@ -58,6 +61,7 @@ sudo udevadm control --reload
 for d in /sys/block/sd* /sys/block/vd*; do
   [ -e "$d" ] && sudo udevadm trigger --action=change --sysname-match="$(basename "$d")"
 done
+# Préparation des disques Flash pour Redis Enterprise
 sudo /opt/redislabs/sbin/prepare_flash.sh -y
 EOF
 )
@@ -117,7 +121,9 @@ sleep 30
 # Instanciation + configuration en parallèle pour nodes 2..N
 echo ">>> Instanciation + join en parallèle des nodes 2..$NODES..."
 tmp_ips_file="$(mktemp)"
+trap 'rm -f "$tmp_ips_file"' EXIT   # cf. docs/tasks.md F-11
 pids=()
+pid_nodes=()   # même index que pids -> n° de noeud, pour nommer les échecs (F-09)
 for i in $(seq 2 "$NODES"); do
   wait_slot
   (
@@ -143,17 +149,46 @@ for i in $(seq 2 "$NODES"); do
 
     # enregistrer l'IP pour le récap final (dans le parent après wait)
     printf "%s %s\n" "$i" "$ip_i" >> "$tmp_ips_file"
-  ) & pids+=("$!")
+  ) & pids+=("$!"); pid_nodes+=("$i")
 done
 
-# 3/ attendre la fin de tous les jobs parallèles
-for p in "${pids[@]}"; do wait "$p"; done
+# 3/ attendre la fin de tous les jobs parallèles.
+# `wait` seul + `set -e` faisait avorter le script au PREMIER échec, sans dire lequel.
+# `|| rc=$?` est exempt de `set -e`, donc on attend tout le monde et on sait exactement
+# quels noeuds ont échoué avant de décider. Cf. docs/tasks.md F-09.
+failed_nodes=()
+for k in "${!pids[@]}"; do
+  rc=0
+  wait "${pids[$k]}" || rc=$?
+  if (( rc != 0 )); then
+    echo " !! [node ${pid_nodes[$k]}] ÉCHEC (exit $rc)"
+    failed_nodes+=("${pid_nodes[$k]}")
+  fi
+done
 
 # reconstruire NODE_IPS avec les IP collectées
 while read -r idx ip; do
   NODE_IPS[idx]="$ip"
 done < "$tmp_ips_file"
-rm -f "$tmp_ips_file"
+
+# ---------- Garde-fou : un noeud en échec = déploiement invalide ----------
+if (( ${#failed_nodes[@]} > 0 )); then
+  echo ""
+  echo "###############################################################################"
+  echo "ERREUR : ${#failed_nodes[@]} noeud(s) en échec : ${failed_nodes[*]}"
+  echo "Le cluster est INCOMPLET. Ne pas considérer ce déploiement comme valide."
+  echo ""
+  echo "VMs créées (à inspecter puis nettoyer -- il n'y a pas de rollback automatique) :"
+  for n in $(seq 1 "$NODES"); do
+    [[ -n "${NODE_IPS[$n]:-}" ]] && echo "  node $n -> ${NODE_IPS[$n]}"
+  done
+  echo ""
+  echo "Diagnostic sur un noeud en échec :"
+  echo "  ssh $SSH_OPTS -i \"$TARGET_SSH_KEY\" outscale@<ip> \\"
+  echo "    'sudo tail -50 /var/log/redis-enterprise-init.log; sudo journalctl -k | grep \"UFW BLOCK\" | tail -30'"
+  echo "###############################################################################"
+  exit 1
+fi
 
 # ---------- Récap DNS ----------
 echo "
@@ -175,7 +210,25 @@ for n in $(seq 1 "$NODES"); do
 done
 echo "###############################################################################################"
 
-echo "Cluster setup complete. Access your cluster at https://$cluster_dns:8443 with username $RS_admin and password $RS_password."
+# ---------- Vérification : c'est le CLUSTER qui doit confirmer, pas ce script ----------
+echo ""
+echo "Vérification du cluster via rladmin sur le node 1 ($ip_master)..."
+rladmin_out="$(ssh $SSH_OPTS -i "$TARGET_SSH_KEY" outscale@"$ip_master" \
+  'sudo /opt/redislabs/bin/rladmin status nodes' 2>&1 || true)"
+actual_nodes="$(printf '%s\n' "$rladmin_out" | grep -oE 'node:[0-9]+' | sort -u | wc -l | tr -d ' ')"
+
+if [[ "$actual_nodes" != "$NODES" ]]; then
+  echo "###############################################################################"
+  echo "ERREUR : le cluster déclare ${actual_nodes} noeud(s), ${NODES} attendu(s)."
+  echo "Sortie brute de 'rladmin status nodes' :"
+  printf '%s\n' "$rladmin_out" | sed 's/^/  /'
+  echo "###############################################################################"
+  exit 1
+fi
+echo "OK : le cluster déclare ${actual_nodes} noeud(s), comme demandé."
+echo ""
+
+echo "Cluster setup complete. Access your cluster at https://$cluster_dns:8443 with username $RS_admin."
 
 # --- Chrono end ---
 mins=$(( SECONDS / 60 ))
