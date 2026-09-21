@@ -166,12 +166,16 @@ done
 
 
 # Ports internes (CIDR du Net)
+# Aligné sur CLUSTER_TCP de /usr/local/sbin/redis-enterprise-firewall (l'ufw embarqué
+# dans l'OMI) : sans cet alignement le SG est plus restrictif que le pare-feu de l'image,
+# et un cluster qui ne se forme pas fait accuser l'image à tort. Cf. docs/tasks.md F-18.
 for spec in \
-  "tcp 8001 8001" "tcp 8002 8002" "tcp 8004 8004" "tcp 8006 8006" \
-  "tcp 8071 8071" "tcp 8443 8443" "tcp 9080 9080" "tcp 9081 9081" \
-  "tcp 9082 9082" "tcp 9091 9091" "tcp 9125 9125" "tcp 9443 9443" \
+  "tcp 8000 8000" "tcp 8001 8001" "tcp 8002 8002" "tcp 8004 8004" \
+  "tcp 8006 8006" "tcp 8070 8070" "tcp 8071 8071" "tcp 8443 8443" \
+  "tcp 8444 8444" "tcp 9080 9080" "tcp 9081 9081" "tcp 9082 9082" \
+  "tcp 9091 9091" "tcp 9125 9125" "tcp 9443 9443" \
   "tcp 10050 10050" "tcp 1968 1968" "tcp 3346 3346" "tcp 3355 3355" \
-  "tcp 36379 36379" \
+  "tcp 3357 3357"  "tcp 36379 36379" \
   "tcp 10000 10049" "tcp 10051 19999" "tcp 20000 29999" \
   "tcp 3333 3345"  "tcp 3347 3349"  "tcp 3350 3354"
 do
