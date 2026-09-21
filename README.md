@@ -1,272 +1,355 @@
-# Redis Enterprise - Run on Outscale
+# Redis Enterprise on Outscale — deployment scripts
 
-This project run Outscale AMIs for Redis Enterprise using [Packer](https://www.packer.io/) and automates the setup and teardown of the required Outscale infrastructure.
+Deploy a **Redis Enterprise cluster** on [Outscale](https://outscale.com) from a pre-built
+machine image (OMI): 3 to 35 nodes, spread across three availability zones, clustered
+automatically. A 3-node cluster takes about **5 minutes**.
 
+This README assumes **no prior knowledge** of Outscale or Redis Enterprise. Follow it top to
+bottom and copy-paste.
 
-## Requirements
+> **Reconstructed 2026-09-21.** This repo had no working documentation; this README was
+> rebuilt from the code. The commands below are read off the scripts, but **the flow has not
+> been re-run end-to-end** since the image gained a host firewall — see
+> [Known issues](#known-issues) before you rely on it.
 
-- [Outscale CLI](https://github.com/outscale/oapi-cli) 
-- Outscale Account
-- [jq](https://stedolan.github.io/jq/) (for parsing JSON in shell scripts)
-- Bash shell (tested on Linux/macOS)
-- Registered SSH key pair (for SSH access)
-- A DNS server and Domain Name where you can customize DNS entries (Add IN NS statements)
-- Tested with BASH 5.x/ZSH
+---
 
-## Initial Setup
+## ⚠️ Read this before you deploy
 
-### Install Packer
+**As shipped, `osc/osc-setup.sh` opens the cluster to the entire internet** — the admin UI
+(port 8443), the REST API (9443, 3346) and every database port (10000-19999) are reachable
+from `0.0.0.0/0`. That is fine for a throwaway evaluation and **not** fine for production or
+anything SecNumCloud-adjacent.
+
+If that is not what you want, either:
+
+- edit the `--IpRange "0.0.0.0/0"` values in `osc/osc-setup.sh` to your own CIDR before
+  running it, **or**
+- skip `osc-setup.sh` entirely and point the scripts at network resources you already own
+  (see [Mode B](#mode-b--use-your-own-network)).
+
+Also: **choose a real admin password.** The old template shipped a weak default.
+
+Tracked as `docs/tasks.md` F-02 and F-06.
+
+---
+
+## 1. What you need
+
+| | |
+|---|---|
+| An Outscale account | with an access key — [Outscale Cockpit](https://cockpit.outscale.com/#/accesskeys) |
+| A Redis Enterprise OMI | built by the companion repo `OSC-RedisEnterprisePacker-Build`. Known-good: `ami-89fe7cac` (Redis Enterprise 8.2.0-78, Ubuntu 22.04, region `eu-west-2`). **The image exists only in the region it was built in.** |
+| A domain name you control | with the ability to add `A` and `NS` records — e.g. `redis.example.com` |
+| A Linux or macOS machine | bash 5 or zsh. A VM inside Outscale is the more secure choice. |
+| `oapi-cli`, `jq`, `ssh` | installed below |
+
+You do **not** need Packer, Terraform, or a Redis Enterprise download — that is all the Build
+repo's job.
+
+## 2. Install the tools
 
 ```sh
-brew tap hashicorp/tap
-brew install hashicorp/tap/packer
-```
-
-### Outscale Setup
-
-1. **OSC-CLI installation**
-
-If you're using Homebrew : 
-
-```sh
+# macOS (Homebrew)
 brew tap outscale/tap
-brew install outscale/tap/oapi-cli
+brew install outscale/tap/oapi-cli jq
 ```
-or check other installation methods here : [Github OAPI-CLI](https://github.com/outscale/oapi-cli) 
 
-2. **Authentication Configuration**
+Other platforms: see [oapi-cli releases](https://github.com/outscale/oapi-cli).
 
-Create a new Access Key ID in [Outscale Cockpit](https://cockpit.outscale.com/#/accesskeys)
-or Click on your username in the upper right corner of the screen and then click on Access Key.
+## 3. Configure Outscale authentication
 
-Add the following keys and values in your shell profile for packer
+Create your access key in the [Cockpit](https://cockpit.outscale.com/#/accesskeys), then:
 
 ```sh
-export OSC_ACCESS_KEY=...
-export OSC_SECRET_KEY=...
-```
-
-and create `~/.osc/config.json`file with the following content :
-
-```json
+mkdir -p ~/.osc
+cat > ~/.osc/config.json <<'EOF'
 {
   "default": {
-    "access_key": "ACCESSKEY",
-    "secret_key": "SECRETKEY",
+    "access_key": "YOUR_ACCESS_KEY",
+    "secret_key": "YOUR_SECRET_KEY",
     "region": "eu-west-2"
   }
 }
+EOF
+chmod 600 ~/.osc/config.json
 ```
 
-Validate that the authentication works by executing the "list VM" call : 
+**Check it works:**
 
 ```sh
 oapi-cli ReadVms
 ```
 
-it should answer something similar to : 
-```json
-{
-  "ResponseContext":{
-    "RequestId":"a79c959b-c6c0-4087-b687-6b20f2dfc1a5"
-  },
-  "Vms":[]
-}
-```
-
-3. **Generate a SSH key pair for outscale**
-
-```sh
-oapi-cli --profile default CreateKeypair \
-  --KeypairName "outscale-tmanson-keypair"
-```
+Success looks like this (an empty `Vms` list is fine — it means you have no VMs yet):
 
 ```json
 {
-  "ResponseContext": {
-    "RequestId": "0475ca1e-d0c5-441d-712a-da55a4175157"
-  },
-  "Keypair": {
-    "PrivateKey": "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----",
-    "KeypairType": "ssh-rsa",
-    "KeypairName": "outscale-tmanson-keypair",
-    "KeypairId": "key-abcdef1234567890abcdef1234567890",
-    "KeypairFingerprint": "11:22:33:44:55:66:77:88:99:00:aa:bb:cc:dd:ee:ff"
-  }
+  "ResponseContext": { "RequestId": "a79c959b-c6c0-4087-b687-6b20f2dfc1a5" },
+  "Vms": []
 }
 ```
 
-Save the `PrivateKey` value in a file `~/.ssh/outscale-tmanson-keypair.rsa` and `chmod 600 ~/.ssh/outscale-tmanson-keypair.rsa`
+If you get an authentication error, re-check the keys and the region.
 
-Replace the \n by linefeed.
-
-In vi you can do this with 
-
-```
-:%s/\\n/\r/g
-```
-
-4. **Choose your Redis Cluster FQDN**
-
-  Let's say you own `paquerette.com` domain, and want to use `outscale.paquerette.com` for the Redis Cluster
-
-Add the following line
-`CLUSTER_DNS=aws.paquerette.com`
-to 
-`_my_env.sh`
-
-
-
-Update `_my_env.sh` with (copy the `_my_env_.sh_template` file)
- * `OWNER`       : Who is owner of the AWS VPC, this will be set in as VPC name and in tag, used by `aws-setup.sh`, ex: `OWNER="thomas-manson"`
- * `REGION`      : Which Region will Redis Enteprise be deployed by `my_instanciate.sh`, ex `REGION=eu-west-3`
- * `REDIS_LOGIN` : Redis Enterprise administrator login,    used by `my_instanciate.sh`, ex `REDIS_LOGIN=adm@redis.io`
- * `REDIS_PWD`   : Redis Enterprise administrator password, used by `my_instanciate.sh`, ex `REDIS_PWD=redis_adm`
- * `FLEX_FLAG`   : Set to "flex" to enable Flex Support, or "" if you want to disable it. Flex allows to use SSD for the DB available memory (at lower costs)
- * `FLEX_SIZE_GB`: Flex Disk Size in GB (2 disks are mounted in RAID0, so you'll get 2x this size as usable disk)
- * `FLEX_IOPS`   : IOPS per volume for io1 (min 100, max 64000 for AWS, 20000 for outscale, ratio 50 IOPS/GB) 
- * `MACHINE_TYPE`: Redis Node machine Type
- * `SSH_KEY`     : Path to the RSA Private Key
-
-
-## Usage
-
-Note: if you run multiple time `aws-setup.sh` / `teardown-aws-vpc.sh` / `build_and_deploy_image_with_packer.sh`, remove from `_my_env.sh` the generated values.
-If you only rerun `aws-setup.sh` without rebuilding the AMI, keep the `AMI_ID` in the `_my_env.sh`
-
-0. **Ensure your _my_env.sh has all required variables set**
+## 4. Create an SSH key pair
 
 ```sh
-REDIS_LOGIN=adm@redis.io
-REDIS_PWD=redis_adm
-OWNER="thomas-manson"
-KEY_NAME=tmanson-aws-key
-CLUSTER_DNS=aws.paquerette.com #for AWS
-REGION=eu-west-3 # for AWS
-#for outscale
-OUTSCALE_CLUSTER_DNS=outscale.paquerette.com
-OUTSCALE_REGION=eu-west-2
-OUTSCALE_SSH_KEY="$HOME/.ssh/outscale-tmanson-keypair.rsa"
+oapi-cli --profile default CreateKeypair --KeypairName "my-redis-keypair"
 ```
 
-Run the following scripts in order from the project root:
-
-1. **Provision the Infrastructure:**
-
-   ```sh
-   cd osc/
-   ./osc-setup.sh
-   ```
-
-   This will append the following variables to `_my_env.sh` with the various IDs generated during the setup of the VPC.
-
-   If your infrastructure is already in place, you can just fill up those variables.
-   The mandatory ones are the AZ*, SUBNET*, SG_ID (Security Group)
-
-   The other variables are used by the tear_down_outscale.sh script to delete all VMs & objets after you're finish testing.
-
-   ```sh
-   NET_ID=vpc-xxx
-   IGW_ID=igw-xxx
-   RTB_ID=rtb-xxx
-   SG_ID=sg-xxx
-   SUBNET1=subnet-xxx
-   SUBNET2=subnet-xxx
-   SUBNET3=subnet-xxx
-   AZ1=eu-west-3a
-   AZ2=eu-west-3b
-   AZ3=eu-west-3c
-   ```
-
-
-2. **Instantiate an EC2 Instance from the Redis Enterprise Packer Image:**
-
-  Choose if you want to use Flex or not.
-  Flex is a technology that allow a Database to use RAM + SSD, without any impact on client code.
-  To use flex, edit the my_instanciate*.sh and edit the following vars: 
+The response contains a `PrivateKey` field with literal `\n` sequences. Save it as a real
+file with real newlines:
 
 ```sh
-FLEX_FLAG="flex" #set to "" if you don't want flex
-FLEX_SIZE_GB="20" #2 disks are mounted in RAID0, so you'll get 2x$FLEX_SIZE_GB as usable disk
-FLEX_IOPS="${FLEX_IOPS:-1000}"  # IOPS per volume for io1 (min 100, max 64000 for AWS, 20000 for outscale, ratio 50 IOPS/GB) 
+# paste the PrivateKey value (without the surrounding quotes) into a file, then:
+printf '%b\n' "$(cat /tmp/key.raw)" > ~/.ssh/my-redis-keypair.rsa
+chmod 600 ~/.ssh/my-redis-keypair.rsa
+ssh-keygen -y -f ~/.ssh/my-redis-keypair.rsa >/dev/null && echo "key is valid"
 ```
 
-   ```sh
-   cd osc/
-   my_instanciate_outscale.sh
-   ```
+The last command prints `key is valid` if the file is a usable private key.
 
-   This will append the following variables to `_my_env.sh` with the various IDs generated during the setup of the VPC
-   ```sh
-   OUTSCALE_INSTANCE_PUBLIC_IP_1=13.38.11.137 #i-0f3731bccbefe8256
-   OUTSCALE_INSTANCE_PUBLIC_IP_2=51.44.42.52 #i-0570bff1ec77d91bf
-   OUTSCALE_INSTANCE_PUBLIC_IP_3=51.44.4.244 #i-0fe563086da4d41df
-   ```
+> **Heads up:** the keypair name is currently **hardcoded** to `outscale-tmanson-keypair` in
+> `osc/instanciate_image_outscale.sh:134` and `osc/connect_to_my_instance.sh:19`. Until
+> `docs/tasks.md` F-13 is fixed, either name your keypair exactly that, or edit those two
+> lines to your own name.
 
-3. **Configure your DNS Zone**
-
-  Edit your DNS zone with the output of the script my_instaciate.sh / my_instanciate_outscale.sh
-
-example : 
-```
-###############################################################################################
-ns1.outscale.paquerette.com. 10800 IN A 171.33.65.166
-ns2.outscale.paquerette.com. 10800 IN A 171.33.82.31
-ns3.outscale.paquerette.com. 10800 IN A 171.33.83.16
-
-outscale.paquerette.com. 10800 IN A 171.33.65.166
-outscale.paquerette.com. 10800 IN A 171.33.82.31
-outscale.paquerette.com. 10800 IN A 171.33.83.16
-
-outscale.paquerette.com. 10800 IN NS ns1.outscale.paquerette.com.
-outscale.paquerette.com. 10800 IN NS ns2.outscale.paquerette.com.
-outscale.paquerette.com. 10800 IN NS ns3.outscale.paquerette.com.
-###############################################################################################
-
-Cluster setup complete. Access your cluster at https://outscale.paquerette.com:8443 with username adm@redis.io and password redis_adm.
-```
-
-If you don't want to wait for DNS propagation, you can flush your local DNS cache with : 
-
-On MacOsX : 
-`sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder`
-
-or 
-
-On Linux:
-`sudo resolvectl flush-caches`
-
-5. **Connect to the Redis Cluster Manager:**
-
-  After having configured the DNS zone, click on the URL displayed at the end of the my_instanciate*.sh script, enter the login & password.
-  
-  Check the Cluster Tab, and Nodes Tab to see that all 3 nodes are there.
-  Then create a simple DB and test that you can connect to it using the generated FQDN (ex: redis-12000.outscale.paquerette.com:12000 for a DB using port 12000)
-
-
-6. **Connect to Your Instance:**
-
-   ```sh
-   cd osc/
-   connect_to_my_instance.sh 1
-   ```
-
-   (Replace `1` with the subnet index if needed.)
-
-## Teardown
-
-When finished, destroy all created AWS resources:
+## 5. Configure the deployment
 
 ```sh
-cd osc/
-teardown-aws-vpc.sh
+cp _my_env.template.sh _my_env.sh
+chmod 600 _my_env.sh            # it will hold your admin password
 ```
 
-## Notes
+Generate a strong admin password and edit `_my_env.sh`:
 
-- The project uses [`packer/ubuntu_ufw_aws_image.pkr.hcl`](packer/ubuntu_ufw_aws_image.pkr.hcl ) as the Packer template.
-- Redis Enterprise tarball must be present in [`redis-software`](redis-software ). You can download it from [`Redis Cloud`](https://cloud.redis.io)
-- Environment variables for resource IDs are stored in `_my_env.sh`.
+```sh
+openssl rand -base64 24         # use this as REDIS_PWD — do not keep the template default
+```
 
-## TODO
-* Ajout de la license
+```sh
+OWNER="your-name"                                   # tags + resource names
+OUTSCALE_REGION=eu-west-2                           # must match your access key's region
+OUTSCALE_SSH_KEY="$HOME/.ssh/my-redis-keypair.rsa"  # the file from step 4
+
+REDIS_LOGIN=admin@example.com                       # Redis Enterprise admin login
+REDIS_PWD='<paste the generated password>'          # NOT the template default
+
+OUTSCALE_CLUSTER_DNS=redis.example.com              # the FQDN you will delegate in step 8
+
+FLEX_FLAG="flex"        # "" to disable Auto Tiering (RAM+SSD)
+FLEX_SIZE_GB="40"       # per volume; 2 volumes in RAID0, so usable = 2x this
+FLEX_IOPS="1000"        # io1 limit is 50 IOPS per GiB, so keep FLEX_IOPS <= 50*FLEX_SIZE_GB
+MACHINE_TYPE="tinav5.c2r4p3"
+
+OUTSCALE_AMI_ID=ami-89fe7cac                        # the OMI from the Build repo
+```
+
+> **Known bug (`docs/tasks.md` F-04):** `MACHINE_TYPE`, `FLEX_FLAG`, `FLEX_SIZE_GB` and
+> `FLEX_IOPS` in this file are currently **ignored** — `osc/instanciate_image_outscale.sh`
+> re-hardcodes them on lines 11-15 (`tinav5.c2r4p3`, `flex`, `40 GB`, `1000` IOPS). To change
+> them today, edit those lines. The values above match the hardcoded ones so there is no
+> surprise.
+
+`_my_env.sh` is gitignored. **Never commit it** — it holds your admin password.
+
+## 6. Create the network
+
+### Mode A — let the script build a throwaway network
+
+```sh
+cd osc
+./osc-setup.sh
+```
+
+Takes about a minute. It creates a Net (`10.0.0.0/16`), an internet gateway, a route table,
+three public subnets (one per availability zone) and one security group, then **appends** the
+resulting IDs to `../_my_env.sh`:
+
+```sh
+OSC_NET_ID=vpc-...      OSC_SUBNET1=subnet-...   OSC_AZ1=eu-west-2a
+OSC_IGW_ID=igw-...      OSC_SUBNET2=subnet-...   OSC_AZ2=eu-west-2b
+OSC_RTB_ID=rtb-...      OSC_SUBNET3=subnet-...   OSC_AZ3=eu-west-2c
+OSC_SG_ID=sg-...
+```
+
+> **Run it once.** It is not idempotent: a second run creates a *second* Net and appends a
+> *second* block. The scripts use the last block, so the first Net becomes invisible to the
+> teardown script and keeps costing you money. If you need to start over, run
+> `./tear_down_outscale.sh` first, then **delete the generated lines from `_my_env.sh` by
+> hand**. Tracked as `docs/tasks.md` F-20.
+
+### Mode B — use your own network
+
+If you already have a landing zone, **skip `osc-setup.sh`** and fill in those nine variables
+yourself. The deployment scripts never check who created the resources. You need:
+
+- **three subnets in three distinct availability zones**, each with public IP assignment on
+  launch (or see F-10 about private topologies);
+- **a security group carrying the full Redis Enterprise port matrix.** Copy the rule set from
+  `osc/osc-setup.sh:132-199` — and add `8444`, `3357` and `8000`, which that script is
+  currently missing (`docs/tasks.md` F-18);
+- **a private CIDR inside `10.0.0.0/8`.** The node bootstrap script detects its own address
+  with `grep '^10\.'`, so a `172.16/12` or `192.168/16` network **will fail** until
+  `docs/tasks.md` F-24 is fixed.
+
+## 7. Deploy the cluster
+
+```sh
+cd osc
+./cluster_instanciate.sh --nodes 3
+```
+
+| Option | Default | Notes |
+|---|---|---|
+| `--nodes <N>` | `3` | must be **odd**, between 3 and 35 — Redis Enterprise needs an odd quorum |
+| `--parallel <0\|N>` | `0` | `0` = no limit. Consider `--parallel 5` for large clusters |
+
+What happens: node 1 boots and runs `rladmin cluster create`; nodes 2..N boot in parallel and
+`rladmin cluster join`. Nodes are placed round-robin across your three AZs, and each node's AZ
+becomes its Redis Enterprise `rack_id`, so the cluster is rack-aware.
+
+The script ends by printing the DNS records you need and the cluster URL.
+
+## 8. Publish the DNS records
+
+Copy the block the script printed into your DNS zone. It looks like this:
+
+```
+ns1.redis.example.com. 10800 IN A 171.33.65.166
+ns2.redis.example.com. 10800 IN A 171.33.82.31
+ns3.redis.example.com. 10800 IN A 171.33.83.16
+
+redis.example.com. 10800 IN A 171.33.65.166
+redis.example.com. 10800 IN A 171.33.82.31
+redis.example.com. 10800 IN A 171.33.83.16
+
+redis.example.com. 10800 IN NS ns1.redis.example.com.
+redis.example.com. 10800 IN NS ns2.redis.example.com.
+redis.example.com. 10800 IN NS ns3.redis.example.com.
+```
+
+**This step is mandatory, not cosmetic.** The `NS` records delegate the zone to the cluster
+itself, which runs its own DNS server — that is what makes each database endpoint
+(`redis-12000.redis.example.com`) resolve and fail over. Nothing verifies you did it; without
+it the cluster is reachable only by raw IP.
+
+Don't want to wait for propagation? Flush your local cache:
+
+```sh
+# macOS
+sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
+# Linux
+sudo resolvectl flush-caches
+```
+
+Check it took effect:
+
+```sh
+dig +short NS redis.example.com
+dig +short redis.example.com
+```
+
+## 9. Open the Cluster Manager
+
+Go to `https://redis.example.com:8443` and log in with the `REDIS_LOGIN` /
+`REDIS_PWD` from step 5. The certificate is self-signed, so your browser will warn you.
+
+**Verify the deployment:**
+
+1. **Nodes** tab — all N nodes present and green.
+2. **Cluster** tab — rack-aware enabled, N nodes, quorum healthy.
+3. Create a small database, note its port (e.g. 12000), and connect:
+   ```sh
+   redis-cli -h redis-12000.redis.example.com -p 12000 PING
+   ```
+   `PONG` means the whole chain — cluster, DNS delegation, firewall — works.
+
+## 10. Log into a node
+
+```sh
+cd osc
+./connect_to_my_instance.sh 1      # 1 = node number
+```
+
+Useful once you are on a node:
+
+```sh
+sudo /opt/redislabs/bin/rladmin status        # cluster state
+sudo cat /var/log/redis-enterprise-init.log   # what the bootstrap script did
+sudo ufw status verbose                       # the host firewall baked into the image
+sudo journalctl -k | grep 'UFW BLOCK'         # what the host firewall is dropping
+```
+
+## Recycling vs. teardown
+
+**To replace the cluster but keep the network** (the usual case — and the only safe one if the
+Net is shared with another project):
+
+```sh
+cd osc
+./destroy_cluster.sh            # add -y to skip the confirmation prompt
+```
+
+It deletes only the VMs tagged `redis-node-<n>`, waits for them to actually terminate (with a
+timeout), prunes the stale node IPs from `_my_env.sh`, warns about any volume still billed, and
+checks the Net and security group survived. Then just re-run `./cluster_instanciate.sh`.
+
+**To destroy everything, network included:**
+
+```sh
+cd osc
+./tear_down_outscale.sh
+```
+
+⚠️ **It asks no questions, and it deletes _every_ VM in the Net** — including any you created
+there by hand. It reads the resource IDs from `_my_env.sh`.
+
+⚠️ **It prints `Teardown terminé.` even when steps failed.** Always verify, and expect to
+clean up `_my_env.sh` yourself:
+
+```sh
+oapi-cli ReadVms  --Filters '{"NetIds":["vpc-xxxxxxxx"]}'   # should be empty
+oapi-cli ReadNets --Filters '{"NetIds":["vpc-xxxxxxxx"]}'   # should be empty
+```
+
+Tracked as `docs/tasks.md` F-21, F-36.
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `NODE_IDX: unbound variable` | you ran `instanciate_image_outscale.sh` without `--node-num`. Known bug F-16 — the real message should be a usage hint. |
+| Nodes boot but never join the cluster | The OMI ships an **active `ufw`**. Check `sudo journalctl -k \| grep 'UFW BLOCK'` on the node, and see F-41 — this combination has not yet been validated end-to-end. |
+| `CreateVms` fails with an IOPS error | `io1` allows at most 50 IOPS per GiB. Keep `FLEX_IOPS <= 50 * FLEX_SIZE_GB` (F-31). |
+| The readiness poll never finishes | If you use a non-`default` `oapi-cli` profile, the `ReadVmsState` poll queries the wrong account and loops forever (F-15). |
+| `SSH not ready after 600s` | Check the security group allows port 22 from your address, and that `OUTSCALE_SSH_KEY` matches the keypair the VM was created with (F-13). |
+| Cluster forms but the UI or metrics misbehave | Ports `8444`, `3357`, `8000` are missing from the security group (F-18). |
+| Teardown said it worked but resources remain | F-21. Verify with the `oapi-cli` commands above and delete by hand. |
+
+## Known issues
+
+This repo has an audited backlog. **Read `docs/tasks.md` before a production deployment** —
+the highest-severity items are:
+
+- **F-41** — the OMI now ships an enforcing host firewall (`ufw`); the scripts never re-scope
+  it and the combination has never been run against a real cluster.
+- **F-02** — the security group defaults to `0.0.0.0/0` on the admin plane and all database ports.
+- **F-05 / F-06** — the admin password leaks into each node's system log, the operator's
+  terminal, and the node's process list; a weak default used to ship in git.
+- **F-04** — `MACHINE_TYPE` and the Flex settings in `_my_env.sh` are silently ignored.
+- **F-20** — re-running `osc-setup.sh` orphans billable resources.
+
+## Documentation map
+
+| For | Read |
+|---|---|
+| Agents / newcomers to the code | [`CLAUDE.md`](CLAUDE.md) |
+| How the pieces fit together | [`docs/architecture/overview.md`](docs/architecture/overview.md) |
+| What each script's contract is | [`docs/specs/`](docs/specs/) |
+| Why it is built this way | [`docs/adr/`](docs/adr/) |
+| What is wrong with it | [`docs/tasks.md`](docs/tasks.md) |
+| The next thing to run | [`docs/runbooks/f-41-ufw-validation.md`](docs/runbooks/f-41-ufw-validation.md) |
+| Problem, users, scope | [`docs/product/PRD.md`](docs/product/PRD.md) |
+| How the image is built | the `OSC-RedisEnterprisePacker-Build` repo |

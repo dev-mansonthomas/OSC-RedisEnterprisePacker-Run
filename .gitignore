@@ -47,4 +47,8 @@ build_scripts/ec2_ubuntu_base_for_redis_enteprise.pem
 .gitignore
 .DS_Store
 _my_env.sh
+_my_env.sh.bak
+_my_env.sh*
+# sorties de diagnostic : logs de deploy, rlcheck, dumps oapi-cli, pr-body
+debug/
 aws/setup-aws-output.txt
